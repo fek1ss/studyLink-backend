@@ -1,4 +1,4 @@
-
+const pdf = require('pdf-parse');
 const sequelize = require('../config/db');
 const Quiz = require('../models/Quiz');
 const Question = require('../models/Question');
@@ -16,6 +16,34 @@ try {
 	gemini = require('../config/gemini');
 } catch (e) {
 	gemini = null;
+}
+
+
+
+// Генерация квиза без авторизации — для тестов фронта
+async function testGenerateQuiz(req, res) {
+  try {
+    const { numQuestions = 5, type = 'multiple-choice' } = req.body;
+    let extractedText = '';
+
+    // Если пользователь загрузил PDF
+    if (req.file) {
+      const data = await pdf(req.file.buffer);
+      extractedText = data.text;
+    } else if (req.body.prompt) {
+      extractedText = req.body.prompt;
+    } else {
+      return res.status(400).json({ error: 'No text or file provided' });
+    }
+
+    // Вызываем AI
+    const quiz = await aiService.generateQuiz(extractedText, { numQuestions, type });
+
+    res.json(quiz);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
 }
 
 // Helper to call AI: expects to return an object { title?, questions: [ { questionText, options, correctAnswer, type } ] }
@@ -227,4 +255,5 @@ module.exports = {
 	getQuizById,
 	publishQuiz,
 	submitResults,
+	testGenerateQuiz,
 };

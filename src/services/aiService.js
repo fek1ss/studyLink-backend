@@ -1,4 +1,5 @@
 require('dotenv').config();
+const util = require('util');
 
 // AI service: generate quizzes from extracted PDF text using Gemini (or fallback)
 const gemini = require('../config/gemini');
@@ -39,7 +40,8 @@ async function generateQuiz(extractedText, options = {}) {
 
 	let aiResponse;
 	try {
-		aiResponse = await gemini.sendPrompt(prompt, { temperature, maxOutputTokens: 1024 });
+		// increase token limit slightly to allow larger JSON outputs
+		aiResponse = await gemini.sendPrompt(prompt, { temperature, maxOutputTokens: 2048 });
 	} catch (err) {
 		// bubble up with context
 		const e = new Error('AI generation failed: ' + (err.message || err));
@@ -51,54 +53,101 @@ async function generateQuiz(extractedText, options = {}) {
 	let parsed = null;
 
 	if (!aiResponse) {
-		throw new Error('Empty response from AI');
+		console.error('Empty response from AI');
+		return { title: `Generated Quiz`, questions: [] };
 	}
 
-	// If response already looks like JSON object with questions, return it
+	// If DEBUG_AI env var is set, dump raw response for troubleshooting
+	if (process.env.DEBUG_AI === '1' || process.env.DEBUG_AI === 'true') {
+		try {
+			console.error('DEBUG_AI raw aiResponse:', util.inspect(aiResponse, { depth: 5, maxArrayLength: 200 }));
+		} catch (e) {
+			console.error('DEBUG_AI failed to inspect aiResponse', e);
+		}
+	}
+
+	// Helper: robustly extract JSON from text (handles ```json fenced blocks and stray markdown)
+	function extractJsonString(text) {
+		if (!text || typeof text !== 'string') return null;
+		// 1) Try to capture fenced code block labeled json: ```json ... ```
+		const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+		if (fenceMatch && fenceMatch[1]) {
+			return fenceMatch[1].trim();
+		}
+		// 2) Remove common markdown wrappers like leading/trailing ``` or ```json markers
+		let cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+		// 3) Remove any markdown headings or lines that just say "json" or "response"
+		cleaned = cleaned.replace(/^\s*(json|response|result)\s*[:\-]*\s*\n/i, '').trim();
+		// 4) Attempt to extract the first JSON object substring
+		const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+		if (jsonMatch) return jsonMatch[0].trim();
+		// 5) As a fallback, return the cleaned text
+		return cleaned;
+	}
+
+	// If response already looks like JSON object with questions, use it
 	if (typeof aiResponse === 'object' && aiResponse.questions) {
 		parsed = aiResponse;
-	} else if (typeof aiResponse === 'object' && aiResponse.text) {
-		// try to parse aiResponse.text
-		try {
-			parsed = JSON.parse(aiResponse.text);
-		} catch (err) {
-			// fallback: try to extract JSON substring
-			const jsonMatch = aiResponse.text.match(/\{[\s\S]*\}/);
-			if (jsonMatch) {
-				try {
-					parsed = JSON.parse(jsonMatch[0]);
-				} catch (e) {
-					// cannot parse
-				}
+	} else {
+		// Determine raw text to parse
+		let text = null;
+		if (typeof aiResponse === 'string') text = aiResponse;
+		else if (typeof aiResponse === 'object' && aiResponse.text) text = aiResponse.text;
+		else if (typeof aiResponse === 'object') {
+			// Attempt to extract textual content from common response shapes (e.g., Gemini candidates)
+			if (Array.isArray(aiResponse.candidates) && aiResponse.candidates.length > 0) {
+				text = aiResponse.candidates.map((c) => {
+					if (!c) return '';
+					if (typeof c === 'string') return c;
+					if (c.output) return String(c.output);
+					if (c.content) {
+						if (Array.isArray(c.content)) return c.content.map(x => x.text || x).join('\n');
+						return String(c.content);
+					}
+					return '';
+				}).join('\n');
 			}
 		}
-	} else if (typeof aiResponse === 'string') {
-		try {
-			parsed = JSON.parse(aiResponse);
-		} catch (err) {
-			const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-			if (jsonMatch) {
-				try {
-					parsed = JSON.parse(jsonMatch[0]);
-				} catch (e) {
-					// ignore
-				}
-			}
-		}
-	}
 
-	if (!parsed) {
-		// As a last resort, return the raw AI response inside an object
-		return { raw: aiResponse };
+		if (text) {
+			const candidate = extractJsonString(text);
+			if (candidate) {
+				try {
+					parsed = JSON.parse(candidate);
+				} catch (err) {
+					// Try a secondary extraction attempt: find inner JSON substring
+					const inner = (candidate.match(/\{[\s\S]*\}/) || [])[0];
+					if (inner) {
+						try { parsed = JSON.parse(inner); } catch (e) {
+							console.error('Failed to parse inner JSON from AI response:', e && e.message ? e.message : e);
+						}
+					} else {
+						console.error('Failed to parse JSON from AI response (no JSON object found after cleaning).');
+					}
+					// Do not throw; we'll handle missing parsed below
+				}
+			} else {
+				console.error('No JSON-like content found in AI response text');
+			}
+		} else {
+			console.error('AI response has no text to parse');
+		}
 	}
 
 	// Basic validation / normalization
-	if (!Array.isArray(parsed.questions)) {
-		throw new Error('AI response does not contain a questions array');
+	if (!parsed) {
+		console.error('AI response could not be parsed as JSON; returning empty questions array');
+		parsed = {};
 	}
 
+	if (!Array.isArray(parsed.questions)) {
+		console.warn('AI response does not contain a questions array; defaulting to empty array');
+	}
+
+	const questionsSource = Array.isArray(parsed.questions) ? parsed.questions : [];
+
 	// Normalize fields for each question
-	const questions = parsed.questions.slice(0, numQuestions).map((q) => {
+	const questions = questionsSource.slice(0, numQuestions).map((q) => {
 		const questionText = q.questionText || q.question || q.prompt || '';
 		const qtype = q.type || type;
 		let options = null;
